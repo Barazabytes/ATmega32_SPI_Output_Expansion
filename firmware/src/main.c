@@ -1,273 +1,380 @@
 /*
- * ATmega32 – 74HC595 LED Control via Hardware SPI
- * ================================================
- * Hardware SPI master drives a 74HC595 shift register
- * that controls 8 LEDs.
+ * ============================================================
+ *  ATmega32 – 74HC595 LED Control via Hardware SPI
+ * ============================================================
  *
- * Pin Mapping
- * -----------
- *  PA0 – Button 1 (LEFT-to-RIGHT sweep)
- *  PA1 – Button 2 (RIGHT-to-LEFT sweep)
- *  PA2 – Button 3 (BLINK all LEDs)
- *  PB4 – LATCH (STC / ST_CP)   → 74HC595 pin 12
- *  PB5 – MOSI  (DS  / SER)     → 74HC595 pin 14
- *  PB7 – SCK   (SHC / SH_CP)   → 74HC595 pin 11
+ *  File organisation
+ *  -----------------
+ *  1. Includes & defines
+ *  2. [SPI INIT]      spi_master_init()
+ *  3. [GPIO INIT]     gpio_init()
+ *  4. [DATA TX]       spi_transmit()
+ *  5. [CLK GEN]       — handled internally by SPCR/SPSR hardware
+ *  6. [LATCH CTRL]    latch_pulse()
+ *  7. [PATTERN SEL]   pattern_select()
+ *  8. [TIMING CTRL]   timing_delay_ms()  +  animation helpers
+ *  9. main()
  *
- * Button wiring: each switch connects its pin to +5 V;
- * pull-down resistors hold the lines LOW when released.
- * A press drives the pin HIGH (active-HIGH logic).
+ *  Pin Mapping
+ *  -----------
+ *   PA0 – Button 1  →  sweep LEFT  to RIGHT
+ *   PA1 – Button 2  →  sweep RIGHT to LEFT
+ *   PA2 – Button 3  →  blink all LEDs
+ *   PB4 – LATCH (STC / ST_CP)   → 74HC595 pin 12
+ *   PB5 – MOSI  (DS  / SER)     → 74HC595 pin 14
+ *   PB7 – SCK   (SHC / SH_CP)   → 74HC595 pin 11
  *
- * Behaviour
- * ---------
- *  Power-on / Reset  : all 8 LEDs OFF
- *  Button 1 pressed  : LEDs light one-by-one, left → right
- *  Button 2 pressed  : LEDs light one-by-one, right → left
- *  Button 3 pressed  : all LEDs blink together (5 times)
- *  (after any animation the LEDs stay in their final state
- *   until the next button press or reset)
+ *  74HC595 static wiring (fix in hardware)
+ *   MR  → VCC  (disable master-reset; must be HIGH)
+ *   OE  → GND  (permanently enable outputs; must be LOW)
+ *
+ *  Button wiring: active-HIGH with external pull-down resistors.
+ *   Each button connects its PA pin to +5 V when pressed;
+ *   a dedicated 10 kΩ resistor per pin pulls it to GND at rest.
+ * ============================================================
  */
 
-#define F_CPU 8000000UL          /* adjust to your crystal */
+/* ============================================================
+ * 1. Includes & Defines
+ * ============================================================ */
+
+#define F_CPU 8000000UL          /* Match your crystal frequency  */
 
 #include <avr/io.h>
 #include <util/delay.h>
 
-/* ── Port / pin aliases ─────────────────────────────────── */
-#define SHIFT_PORT  PORTB
+/* --- SPI / Shift-register pins (Port B) --- */
 #define SHIFT_DDR   DDRB
+#define SHIFT_PORT  PORTB
 
-#define BTN1        PA0          /* left-to-right sweep     */
-#define BTN2        PA1          /* right-to-left sweep     */
-#define BTN3        PA2          /* blink                   */
+#define LATCH_PIN   PB4          /* ST_CP – storage/latch clock   */
+#define MOSI_PIN    PB5          /* DS    – serial data           */
+/* PB6 = MISO, left as input (not connected to 74HC595)          */
+#define SCK_PIN     PB7          /* SH_CP – shift clock           */
 
-#define LATCH_PIN   PB4          /* ST_CP – storage latch   */
-#define MOSI_PIN    PB5          /* SER   – serial data     */
-#define SCK_PIN     PB7          /* SH_CP – shift clock     */
+/* --- Button input pins (Port A) --- */
+#define BTN_DDR     DDRA
+#define BTN_PORT    PORTA
+#define BTN_PIN     PINA
 
-/* ── Timing constants (ms) ──────────────────────────────── */
-#define STEP_DELAY_MS   150U     /* inter-step pause in sweeps  */
-#define BLINK_ON_MS     300U     /* blink ON  half-period        */
-#define BLINK_OFF_MS    300U     /* blink OFF half-period        */
-#define BLINK_COUNT       5U     /* number of blink cycles       */
-#define DEBOUNCE_MS      20U     /* button debounce delay        */
+#define BTN1        PA0          /* Sweep left  → right           */
+#define BTN2        PA1          /* Sweep right → left            */
+#define BTN3        PA2          /* Blink all                     */
 
-/* ══════════════════════════════════════════════════════════
- * SPI / 74HC595 helpers
- * ══════════════════════════════════════════════════════════ */
+/* --- Timing constants (all in milliseconds) --- */
+#define SWEEP_STEP_MS   150U     /* Pause between each sweep step */
+#define BLINK_ON_MS     300U     /* LED-on  duration per blink    */
+#define BLINK_OFF_MS    300U     /* LED-off duration per blink    */
+#define BLINK_CYCLES      5U     /* Total on/off blink cycles     */
+#define DEBOUNCE_MS      20U     /* Debounce settling time        */
 
-/**
- * spi_init – configure ATmega32 hardware SPI as master.
+/* --- Pattern type tag --- */
+typedef enum {
+    PATTERN_NONE  = 0,
+    PATTERN_LTR,                 /* left-to-right sweep           */
+    PATTERN_RTL,                 /* right-to-left sweep           */
+    PATTERN_BLINK                /* full blink                    */
+} pattern_t;
+
+
+/* ============================================================
+ * 2. SPI INIT — Configure ATmega32 as SPI master
+ * ============================================================
  *
- * ATmega32 SPI pins (fixed by hardware):
- *   PB4 = /SS  (we repurpose as the 74HC595 LATCH – driven manually)
- *   PB5 = MOSI
- *   PB6 = MISO (unused but set as input automatically)
- *   PB7 = SCK
+ * The ATmega32 SPI peripheral has fixed pin assignments on PB:
+ *   PB4 = /SS  → repurposed here as manual LATCH output
+ *   PB5 = MOSI → serial data to 74HC595 DS pin
+ *   PB6 = MISO → unused (left as input)
+ *   PB7 = SCK  → shift clock to 74HC595 SH_CP pin
  *
- * We set PB4 as a general-purpose output and toggle it
- * manually for the latch pulse, which is the standard
- * approach when /SS is not wired to the slave's chip-select.
- */
-static void spi_init(void)
+ * SPCR settings used:
+ *   SPE  = 1  : enable the SPI module
+ *   MSTR = 1  : master mode (ATmega32 drives SCK)
+ *   CPOL = 0  : clock idle LOW  (Mode 0 – 74HC595 compatible)
+ *   CPHA = 0  : data sampled on leading (rising) edge
+ *   DORD = 0  : MSB transmitted first
+ *   SPR1:SPR0 = 00 : fosc/4 → 2 MHz @ 8 MHz crystal
+ *
+ * The LATCH pin (PB4) is driven manually as a GPIO because the
+ * 74HC595 ST_CP is edge-triggered, not a SPI chip-select.
+ * ============================================================ */
+static void spi_master_init(void)
 {
-    /* Set MOSI, SCK, and LATCH as outputs; MISO stays input */
+    /*
+     * Data-direction: MOSI, SCK, and LATCH → outputs.
+     * MISO stays as input (ATmega32 hardware requirement).
+     */
     SHIFT_DDR |= (1 << MOSI_PIN) | (1 << SCK_PIN) | (1 << LATCH_PIN);
 
-    /* Latch starts LOW (data only latched on rising edge) */
+    /* Pre-assert LATCH LOW so a clean rising edge latches later. */
     SHIFT_PORT &= ~(1 << LATCH_PIN);
 
     /*
-     * SPCR – SPI Control Register
-     *   SPE  (bit 6) : enable SPI
-     *   MSTR (bit 4) : master mode
-     *   CPOL (bit 3) : clock polarity 0 (idle LOW)  ← 74HC595 compatible
-     *   CPHA (bit 2) : clock phase   0 (sample on leading edge)
-     *   SPR1:SPR0    : 00 → fosc/4  (2 MHz @ 8 MHz crystal – plenty fast)
-     *
-     * Data order: MSB first (bit 7 of the byte → Q7 of 74HC595,
-     * which we treat as LED 8 / rightmost).
-     * If your LED wiring is reversed, flip the byte before sending.
+     * Write SPCR: SPE | MSTR
+     * CPOL=0, CPHA=0, DORD=0, SPR1:0=00 are all default zeros.
      */
     SPCR = (1 << SPE) | (1 << MSTR);
-    /* SPSR – no double-speed needed */
+
+    /*
+     * SPSR: SPI2X=0 → no double-speed.
+     * Effective SCK = 8 MHz / 4 = 2 MHz, well within the
+     * 74HC595's 25 MHz maximum shift frequency.
+     */
 }
 
-/**
- * spi_send_byte – shift one byte into the 74HC595.
+
+/* ============================================================
+ * 3. GPIO INIT — Configure buttons and latch pin
+ * ============================================================
  *
- * Writing to SPDR starts the transmission; reading SPSR's SPIF
- * bit confirms completion (hardware clears SPIF on next SPDR
- * access, so we just poll it here).
- */
-static void spi_send_byte(uint8_t data)
-{
-    SPDR = data;                             /* start transmission  */
-    while (!(SPSR & (1 << SPIF)));          /* wait until done     */
-}
-
-/**
- * sr_latch – pulse the LATCH line to transfer the shift
- * register contents to the storage register (output latches).
- * The 74HC595 latches on the rising edge of ST_CP.
- */
-static inline void sr_latch(void)
-{
-    SHIFT_PORT |=  (1 << LATCH_PIN);        /* rising edge – latch */
-    SHIFT_PORT &= ~(1 << LATCH_PIN);        /* bring back LOW      */
-}
-
-/**
- * led_write – send one byte to the 74HC595 and latch it.
+ * Port A bits 0-2 are button inputs.
+ * External 10 kΩ pull-down resistors are on each pin, so the
+ * internal pull-ups (PORTA register) must remain cleared.
  *
- * Bit 7 → Q7 (LED 8), Bit 0 → Q0 (LED 1) with MSB-first SPI.
- * A '1' lights an LED (assumes active-HIGH LED wiring on Q0–Q7).
- */
-static void led_write(uint8_t pattern)
+ * The LATCH pin direction is already set inside spi_master_init
+ * because it shares Port B's DDR with the SPI output pins.
+ * ============================================================ */
+static void gpio_init(void)
 {
-    spi_send_byte(pattern);
-    sr_latch();
+    /* Bits 0-2 as inputs (clear DDR bits). */
+    BTN_DDR &= ~((1 << BTN1) | (1 << BTN2) | (1 << BTN3));
+
+    /* Disable internal pull-ups (external pull-downs are used). */
+    BTN_PORT &= ~((1 << BTN1) | (1 << BTN2) | (1 << BTN3));
 }
 
-/* ══════════════════════════════════════════════════════════
- * Button helpers
- * ══════════════════════════════════════════════════════════ */
 
-/**
- * buttons_init – configure Port A pins as inputs.
+/* ============================================================
+ * 4. DATA TRANSMISSION — Send 8-bit LED pattern via MOSI
+ * ============================================================
  *
- * With external pull-down resistors the internal pull-ups are
- * not needed, so we leave PORTA bits 0-2 cleared (no pull-up).
- */
-static void buttons_init(void)
+ * Writing a byte to SPDR triggers hardware transmission.
+ * The SPI peripheral shifts the byte out MSB-first on MOSI,
+ * generating SCK pulses automatically (see section 5).
+ * Polling SPIF in SPSR confirms the 8-clock transfer is done.
+ *
+ *  Bit 7 of `data` → first bit on MOSI → enters 74HC595 SER
+ *                    → after 8 clocks sits at Q7 output.
+ *  Bit 0 of `data` → last  bit on MOSI → sits at Q0 output.
+ * ============================================================ */
+static void spi_transmit(uint8_t data)
 {
-    DDRA  &= ~((1 << BTN1) | (1 << BTN2) | (1 << BTN3));  /* inputs  */
-    PORTA &= ~((1 << BTN1) | (1 << BTN2) | (1 << BTN3));  /* no pull-up */
+    SPDR = data;                        /* Load byte → start TX   */
+    while (!(SPSR & (1 << SPIF)));     /* Wait for SPIF flag     */
+    /*
+     * Reading SPDR (or a subsequent write to it) clears SPIF.
+     * Here we only write, so SPIF stays set but that is harmless
+     * because the next spi_transmit() will overwrite SPDR first.
+     */
 }
 
-/** is_pressed – return non-zero if the given PA pin is HIGH. */
-static inline uint8_t is_pressed(uint8_t pin)
+
+/* ============================================================
+ * 5. CLOCK GENERATION — SCK from the SPI peripheral
+ * ============================================================
+ *
+ * No explicit function is needed: the ATmega32 SPI module
+ * drives PB7 (SCK) automatically when SPE=1 and MSTR=1.
+ *
+ * SCK characteristics (from SPCR/SPSR settings above):
+ *   Polarity : idle LOW  (CPOL = 0)
+ *   Phase    : data valid on rising edge (CPHA = 0) – SPI Mode 0
+ *   Frequency: fosc / 4 = 2 MHz  (SPI2X = 0, SPR1:0 = 00)
+ *
+ * The 74HC595 SH_CP input latches DS on the rising SCK edge,
+ * which matches Mode 0 exactly.
+ * ============================================================ */
+
+
+/* ============================================================
+ * 6. LATCH CONTROL — Toggle latch after SPI transfer
+ * ============================================================
+ *
+ * After spi_transmit() completes, the 8 bits sit in the
+ * 74HC595 shift register but have NOT appeared on Q0-Q7 yet.
+ * A LOW→HIGH→LOW pulse on ST_CP (LATCH_PIN / PB4) copies the
+ * shift register into the storage register, updating outputs.
+ *
+ * The pulse must be at least 20 ns wide (74HC595 datasheet,
+ * Vcc = 5 V).  Two consecutive PORT writes at 8 MHz give
+ * ~125 ns each, far exceeding the minimum requirement.
+ * ============================================================ */
+static void latch_pulse(void)
 {
-    return (PINA & (1 << pin));
+    SHIFT_PORT |=  (1 << LATCH_PIN);   /* Rising  edge → latch   */
+    SHIFT_PORT &= ~(1 << LATCH_PIN);   /* Return LOW for next TX */
 }
 
-/**
- * wait_for_release – busy-wait until all three buttons are
- * released, then add a short debounce delay.
- */
-static void wait_for_release(void)
+
+/* ============================================================
+ * 7. PATTERN SELECTION — Select LED pattern from button input
+ * ============================================================
+ *
+ * scan_buttons() samples PA0-PA2 and returns a pattern_t.
+ * It applies a two-stage debounce:
+ *   Stage 1 – detect initial press.
+ *   Stage 2 – wait DEBOUNCE_MS, then confirm pin is still HIGH.
+ * Returns PATTERN_NONE if no button is pressed or passes
+ * debounce. Priority order: BTN1 > BTN2 > BTN3.
+ * ============================================================ */
+static inline uint8_t btn_raw(uint8_t pin)
 {
-    while (is_pressed(BTN1) || is_pressed(BTN2) || is_pressed(BTN3));
+    return (BTN_PIN & (1 << pin)) ? 1 : 0;
+}
+
+static pattern_t scan_buttons(void)
+{
+    if (btn_raw(BTN1)) {
+        _delay_ms(DEBOUNCE_MS);
+        if (btn_raw(BTN1)) return PATTERN_LTR;
+    }
+    else if (btn_raw(BTN2)) {
+        _delay_ms(DEBOUNCE_MS);
+        if (btn_raw(BTN2)) return PATTERN_RTL;
+    }
+    else if (btn_raw(BTN3)) {
+        _delay_ms(DEBOUNCE_MS);
+        if (btn_raw(BTN3)) return PATTERN_BLINK;
+    }
+    return PATTERN_NONE;
+}
+
+/* Wait until all buttons are released, then debounce-settle. */
+static void wait_release(void)
+{
+    while (btn_raw(BTN1) || btn_raw(BTN2) || btn_raw(BTN3));
     _delay_ms(DEBOUNCE_MS);
 }
 
-/* ══════════════════════════════════════════════════════════
- * LED animations
- * ══════════════════════════════════════════════════════════ */
+/*
+ * led_update – the single point that combines sections 4, 5, 6:
+ *   transmit data  (SCK generated by hardware during transmit)
+ *   pulse latch    (outputs update after this call returns)
+ */
+static void led_update(uint8_t pattern)
+{
+    spi_transmit(pattern);   /* [DATA TX]   shift bits via MOSI  */
+                             /* [CLK GEN]   SCK auto-generated   */
+    latch_pulse();           /* [LATCH CTRL] commit to outputs   */
+}
 
-/**
- * anim_left_to_right – illuminate LEDs one by one from Q0→Q7.
+
+/* ============================================================
+ * 8. TIMING CONTROL — Delays between LED pattern updates
+ * ============================================================
  *
- * Pattern progression (binary, Q7..Q0):
- *   0000 0001  →  0000 0011  →  …  →  1111 1111
- */
-static void anim_left_to_right(void)
+ * timing_delay_ms() wraps _delay_ms so the delay magnitude is
+ * a runtime variable rather than a compile-time constant.
+ * Used by all three animation routines below.
+ * ============================================================ */
+static void timing_delay_ms(uint16_t ms)
 {
-    uint8_t pattern = 0x00;
-    for (uint8_t i = 0; i < 8; i++)
-    {
-        pattern = (pattern >> 1) | 0x80;   /* shift in a '1' from MSB  */
-        /*
-         * Alternatively, to fill from LSB (Q0 first):
-         *   pattern |= (1 << i);
-         * Choose whichever matches your physical LED order.
-         *
-         * Using MSB-shift: first byte = 1000 0000, last = 1111 1111,
-         * so Q7 lights first and Q0 last.  Swap the line below if you
-         * want Q0 first:
-         *   pattern |= (uint8_t)(1 << i);
-         */
-        led_write(pattern);
-        _delay_ms(STEP_DELAY_MS);
+    while (ms--) {
+        _delay_ms(1);
     }
 }
 
-/**
- * anim_right_to_left – illuminate LEDs one by one from Q7→Q0.
+/* --- Animation: sweep left → right (Q7 first, Q0 last) ---
+ *
+ * Pattern progression each SWEEP_STEP_MS:
+ *   Step 1: 1000 0000  (Q7 ON)
+ *   Step 2: 1100 0000  (Q7, Q6 ON)
+ *   ...
+ *   Step 8: 1111 1111  (all ON)
+ *
+ * The shift fills from the MSB because the SPI sends MSB first;
+ * the first bit shifted out lands at Q7 after 8 clock pulses.
+ * Swap to `pattern |= (1 << i)` if your board wires Q0 as LED1.
  */
-static void anim_right_to_left(void)
+static void anim_sweep_ltr(void)
 {
     uint8_t pattern = 0x00;
-    for (uint8_t i = 0; i < 8; i++)
-    {
-        pattern = (pattern << 1) | 0x01;   /* shift in a '1' from LSB  */
-        led_write(pattern);
-        _delay_ms(STEP_DELAY_MS);
+    for (uint8_t i = 0; i < 8; i++) {
+        pattern = (uint8_t)((pattern >> 1) | 0x80); /* fill MSB→LSB */
+        led_update(pattern);
+        timing_delay_ms(SWEEP_STEP_MS);
     }
 }
 
-/**
- * anim_blink – flash all 8 LEDs together BLINK_COUNT times,
- * then leave them OFF.
+/* --- Animation: sweep right → left (Q0 first, Q7 last) ---
+ *
+ * Pattern progression each SWEEP_STEP_MS:
+ *   Step 1: 0000 0001  (Q0 ON)
+ *   Step 2: 0000 0011  (Q0, Q1 ON)
+ *   ...
+ *   Step 8: 1111 1111  (all ON)
+ */
+static void anim_sweep_rtl(void)
+{
+    uint8_t pattern = 0x00;
+    for (uint8_t i = 0; i < 8; i++) {
+        pattern = (uint8_t)((pattern << 1) | 0x01); /* fill LSB→MSB */
+        led_update(pattern);
+        timing_delay_ms(SWEEP_STEP_MS);
+    }
+}
+
+/* --- Animation: blink all LEDs BLINK_CYCLES times ---
+ *
+ * Writes 0xFF (all ON) then 0x00 (all OFF) with separate
+ * configurable on/off delays; leaves all LEDs OFF at end.
  */
 static void anim_blink(void)
 {
-    for (uint8_t i = 0; i < BLINK_COUNT; i++)
-    {
-        led_write(0xFF);                    /* all ON                   */
-        _delay_ms(BLINK_ON_MS);
-        led_write(0x00);                    /* all OFF                  */
-        _delay_ms(BLINK_OFF_MS);
+    for (uint8_t i = 0; i < BLINK_CYCLES; i++) {
+        led_update(0xFF);
+        timing_delay_ms(BLINK_ON_MS);
+        led_update(0x00);
+        timing_delay_ms(BLINK_OFF_MS);
     }
 }
 
-/* ══════════════════════════════════════════════════════════
- * Main
- * ══════════════════════════════════════════════════════════ */
 
+/* ============================================================
+ * 9. main()
+ * ============================================================ */
 int main(void)
 {
-    /* ── Initialise peripherals ── */
-    buttons_init();
-    spi_init();
+    /* [SPI INIT]  Configure ATmega32 as SPI master ----------- */
+    spi_master_init();
 
-    /* ── Power-on state: all LEDs OFF ── */
-    led_write(0x00);
+    /* [GPIO INIT] Configure buttons and latch pin ------------ */
+    gpio_init();
 
-    /* ── Main event loop ── */
+    /* Power-on safe state: all LEDs OFF ---------------------- */
+    led_update(0x00);
+
+    /* Main event loop ---------------------------------------- */
     while (1)
     {
-        /* Simple priority: BTN1 > BTN2 > BTN3 */
+        /* [PATTERN SEL] read buttons with debounce */
+        pattern_t selected = scan_buttons();
 
-        if (is_pressed(BTN1))
-        {
-            _delay_ms(DEBOUNCE_MS);          /* debounce on press       */
-            if (is_pressed(BTN1))            /* confirm still pressed   */
-            {
-                led_write(0x00);             /* reset before animation  */
-                wait_for_release();          /* wait for finger off     */
-                anim_left_to_right();
-            }
+        if (selected == PATTERN_NONE) {
+            continue;                    /* nothing pressed, keep polling */
         }
-        else if (is_pressed(BTN2))
-        {
-            _delay_ms(DEBOUNCE_MS);
-            if (is_pressed(BTN2))
-            {
-                led_write(0x00);
-                wait_for_release();
-                anim_right_to_left();
-            }
-        }
-        else if (is_pressed(BTN3))
-        {
-            _delay_ms(DEBOUNCE_MS);
-            if (is_pressed(BTN3))
-            {
-                wait_for_release();
+
+        /* Clear LEDs before every animation */
+        led_update(0x00);
+
+        /* Release button before animation starts */
+        wait_release();
+
+        /* [TIMING CTRL] dispatch animation; delays are inside each */
+        switch (selected) {
+            case PATTERN_LTR:
+                anim_sweep_ltr();
+                break;
+            case PATTERN_RTL:
+                anim_sweep_rtl();
+                break;
+            case PATTERN_BLINK:
                 anim_blink();
-            }
+                break;
+            default:
+                break;
         }
     }
 
-    return 0;                                /* never reached           */
+    return 0;  /* never reached */
 }
